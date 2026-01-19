@@ -18,10 +18,12 @@
   "author": "Consulta PE",
   "license": "MIT",
   "dependencies": {
+    "@google-cloud/storage": "^7.14.0",
     "axios": "^1.7.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.1"
+    "express": "^4.21.1",
+    "firebase-admin": "^13.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
