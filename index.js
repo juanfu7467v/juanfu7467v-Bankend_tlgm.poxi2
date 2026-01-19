@@ -3,7 +3,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
 import admin from "firebase-admin";
-import { Storage } from "@google-cloud/storage";
 
 // Carga las variables de entorno desde .env
 dotenv.config();
@@ -21,12 +20,16 @@ app.use(express.json());
    Inicialización de Firebase
 ============================ */
 
-// Configuración de Firebase desde variables de entorno
+// Configuración de Firebase desde variables de entorno con limpieza de la clave privada
 const firebaseConfig = {
   type: process.env.FIREBASE_TYPE,
   project_id: process.env.FIREBASE_PROJECT_ID,
   private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  // Limpiar la clave privada: eliminar comillas extras y mantener saltos de línea correctos
+  private_key: process.env.FIREBASE_PRIVATE_KEY
+    ?.replace(/\\n/g, '\n')
+    .replace(/"/g, '')
+    .trim(),
   client_email: process.env.FIREBASE_CLIENT_EMAIL,
   client_id: process.env.FIREBASE_CLIENT_ID,
   auth_uri: process.env.FIREBASE_AUTH_URI,
@@ -43,21 +46,44 @@ let bucket;
 
 try {
   if (!admin.apps.length) {
+    // Validar que la configuración mínima esté presente
+    if (!firebaseConfig.private_key || !firebaseConfig.client_email || !firebaseConfig.project_id) {
+      throw new Error("Configuración de Firebase incompleta. Verifica las variables de entorno.");
+    }
+    
     firebaseApp = admin.initializeApp({
       credential: admin.credential.cert(firebaseConfig),
-      storageBucket: process.env.BUCKET_STORAGE
+      storageBucket: process.env.BUCKET_STORAGE || "consulta-pe-abf99.firebasestorage.app"
     });
     console.log("✅ Firebase Admin SDK inicializado correctamente");
+    
+    // Verificar la conexión con una operación simple
+    storage = admin.storage();
+    bucket = storage.bucket();
+    
+    // Probar la conexión listando archivos (operación liviana)
+    await bucket.getFiles({ maxResults: 1 });
+    console.log(`✅ Firebase Storage inicializado. Bucket: ${bucket.name}`);
   } else {
     firebaseApp = admin.app();
+    storage = admin.storage();
+    bucket = storage.bucket();
   }
-  
-  storage = admin.storage();
-  bucket = storage.bucket();
-  console.log(`✅ Firebase Storage inicializado. Bucket: ${process.env.BUCKET_STORAGE}`);
 } catch (error) {
   console.error("❌ Error al inicializar Firebase:", error.message);
+  console.error("Detalles del error:", error);
+  
+  // Si hay un error de decodificación específico, sugerir solución
+  if (error.message.includes("DECODER routines") || error.message.includes("PEM")) {
+    console.warn("⚠️ Posible problema con el formato de la clave privada de Firebase");
+    console.warn("   Asegúrate de que FIREBASE_PRIVATE_KEY tenga el formato correcto:");
+    console.warn("   - Debe comenzar con -----BEGIN PRIVATE KEY-----");
+    console.warn("   - Debe terminar con -----END PRIVATE KEY-----");
+    console.warn("   - Los saltos de línea deben ser \\n literales");
+  }
+  
   console.warn("⚠️ El sistema funcionará sin almacenamiento en Firebase");
+  bucket = null;
 }
 
 /* ============================
@@ -95,13 +121,16 @@ const checkStorageCache = async (endpoint, paramName, paramValue) => {
   
   try {
     const prefix = `consultas/${endpoint.replace(/\//g, '_').replace(/^_/, '')}/`;
-    const [files] = await bucket.getFiles({ prefix });
+    const [files] = await bucket.getFiles({ prefix, maxResults: 50 });
+    
+    if (files.length === 0) return null;
     
     // Buscar archivos que contengan el paramValue en su nombre
-    const matchingFiles = files.filter(file => 
-      file.name.includes(`${paramName}_${paramValue}_`) || 
-      file.name.includes(paramValue)
-    );
+    const matchingFiles = files.filter(file => {
+      const fileName = file.name.toLowerCase();
+      const searchValue = paramValue.toString().toLowerCase();
+      return fileName.includes(searchValue);
+    });
     
     // Ordenar por fecha (más reciente primero)
     matchingFiles.sort((a, b) => {
@@ -113,23 +142,35 @@ const checkStorageCache = async (endpoint, paramName, paramValue) => {
     if (matchingFiles.length > 0) {
       const latestFile = matchingFiles[0];
       
-      // Descargar y leer el archivo
-      const [fileContent] = await latestFile.download();
-      const contentString = fileContent.toString();
-      
       try {
-        const parsedContent = JSON.parse(contentString);
-        console.log(`✅ Resultado encontrado en Storage: ${latestFile.name}`);
-        return parsedContent;
-      } catch (error) {
-        // Si no es JSON, podría ser una referencia a un archivo binario
-        return { storageReference: latestFile.name, rawContent: contentString };
+        // Descargar y leer el archivo
+        const [fileContent] = await latestFile.download();
+        const contentString = fileContent.toString('utf8');
+        
+        // Verificar si es JSON válido
+        if (contentString.trim().startsWith('{') || contentString.trim().startsWith('[')) {
+          const parsedContent = JSON.parse(contentString);
+          console.log(`✅ Resultado encontrado en Storage: ${latestFile.name}`);
+          return parsedContent;
+        } else {
+          // Si no es JSON, devolver como texto
+          return { 
+            success: true, 
+            message: "Resultado desde caché",
+            data: contentString,
+            storageReference: latestFile.name 
+          };
+        }
+      } catch (parseError) {
+        console.warn(`⚠️ Error al parsear archivo de caché ${latestFile.name}:`, parseError.message);
+        return null;
       }
     }
     
     return null;
   } catch (error) {
     console.error("❌ Error al buscar en Storage:", error.message);
+    // No propagamos el error para que el sistema siga funcionando
     return null;
   }
 };
@@ -144,7 +185,9 @@ const saveTextToStorage = async (endpoint, paramName, paramValue, data) => {
     const filePath = generateStoragePath(endpoint, paramName, paramValue);
     const file = bucket.file(filePath);
     
-    const content = JSON.stringify(data, null, 2);
+    // Convertir a JSON si es un objeto, mantener como string si ya lo es
+    const content = typeof data === 'object' ? JSON.stringify(data, null, 2) : String(data);
+    
     await file.save(content, {
       metadata: {
         contentType: 'application/json',
@@ -152,12 +195,13 @@ const saveTextToStorage = async (endpoint, paramName, paramValue, data) => {
           endpoint: endpoint,
           paramName: paramName,
           paramValue: paramValue,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          source: 'api-cache'
         }
       }
     });
     
-    console.log(`✅ Texto guardado en Storage: ${filePath}`);
+    console.log(`✅ Texto guardado en Storage: ${filePath} (${content.length} bytes)`);
     return filePath;
   } catch (error) {
     console.error("❌ Error al guardar texto en Storage:", error.message);
@@ -174,52 +218,80 @@ const saveMediaFromUrl = async (endpoint, paramName, paramValue, url, contentTyp
   try {
     // Determinar extensión del archivo
     let extension = 'bin';
-    if (contentType.includes('image')) {
-      extension = url.split('.').pop().split('?')[0] || 'jpg';
-    } else if (contentType.includes('pdf')) {
+    const urlLower = url.toLowerCase();
+    
+    if (urlLower.includes('.jpg') || urlLower.includes('.jpeg')) {
+      extension = 'jpg';
+      contentType = 'image/jpeg';
+    } else if (urlLower.includes('.png')) {
+      extension = 'png';
+      contentType = 'image/png';
+    } else if (urlLower.includes('.gif')) {
+      extension = 'gif';
+      contentType = 'image/gif';
+    } else if (urlLower.includes('.pdf')) {
       extension = 'pdf';
+      contentType = 'application/pdf';
+    } else if (urlLower.includes('.webp')) {
+      extension = 'webp';
+      contentType = 'image/webp';
     }
     
     const filePath = generateMediaPath(endpoint, paramName, paramValue, extension);
     const file = bucket.file(filePath);
     
-    // Descargar el archivo desde la URL
-    const response = await axios({
-      method: 'GET',
-      url: url,
-      responseType: 'stream'
-    });
+    // Configurar timeout para la descarga
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 segundos timeout
     
-    // Configurar el tipo de contenido
-    const writeStream = file.createWriteStream({
-      metadata: {
-        contentType: response.headers['content-type'] || contentType,
-        metadata: {
-          endpoint: endpoint,
-          paramName: paramName,
-          paramValue: paramValue,
-          originalUrl: url,
-          timestamp: new Date().toISOString()
+    try {
+      // Descargar el archivo desde la URL
+      const response = await axios({
+        method: 'GET',
+        url: url,
+        responseType: 'arraybuffer',
+        signal: controller.signal,
+        timeout: 30000,
+        maxContentLength: 10 * 1024 * 1024, // 10MB límite
+        validateStatus: function (status) {
+          return status >= 200 && status < 300; // Solo aceptar respuestas 2xx
         }
-      }
-    });
-    
-    // Pipe del stream de respuesta al stream de escritura
-    response.data.pipe(writeStream);
-    
-    return new Promise((resolve, reject) => {
-      writeStream.on('finish', () => {
-        console.log(`✅ ${contentType} guardado en Storage: ${filePath}`);
-        resolve(filePath);
       });
       
-      writeStream.on('error', (error) => {
-        console.error(`❌ Error al guardar ${contentType} en Storage:`, error.message);
-        reject(error);
+      clearTimeout(timeoutId);
+      
+      // Guardar en Firebase Storage
+      await file.save(Buffer.from(response.data), {
+        metadata: {
+          contentType: response.headers['content-type'] || contentType,
+          metadata: {
+            endpoint: endpoint,
+            paramName: paramName,
+            paramValue: paramValue,
+            originalUrl: url,
+            timestamp: new Date().toISOString(),
+            contentLength: response.data.length
+          }
+        }
       });
-    });
+      
+      console.log(`✅ ${contentType} guardado en Storage: ${filePath} (${response.data.length} bytes)`);
+      return filePath;
+    } catch (downloadError) {
+      clearTimeout(timeoutId);
+      
+      if (downloadError.code === 'ECONNABORTED' || downloadError.name === 'AbortError') {
+        console.error(`❌ Timeout al descargar ${contentType} desde ${url}`);
+      } else if (downloadError.response) {
+        console.error(`❌ Error HTTP ${downloadError.response.status} al descargar ${contentType}`);
+      } else {
+        console.error(`❌ Error al descargar ${contentType}:`, downloadError.message);
+      }
+      
+      return null;
+    }
   } catch (error) {
-    console.error(`❌ Error al descargar/guardar ${contentType}:`, error.message);
+    console.error(`❌ Error al procesar ${contentType}:`, error.message);
     return null;
   }
 };
@@ -230,63 +302,89 @@ const saveMediaFromUrl = async (endpoint, paramName, paramValue, url, contentTyp
 const handleWithCache = async (req, res, apiPath, paramName, paramValue) => {
   const endpoint = req.path;
   
-  // 1. Verificar si existe en Storage
-  const cachedResult = await checkStorageCache(endpoint, paramName, paramValue);
-  if (cachedResult) {
-    return res.status(200).json(cachedResult);
+  // 1. Verificar si existe en Storage (si está disponible)
+  if (bucket) {
+    try {
+      const cachedResult = await checkStorageCache(endpoint, paramName, paramValue);
+      if (cachedResult) {
+        return res.status(200).json(cachedResult);
+      }
+    } catch (cacheError) {
+      console.warn("⚠️ Error en caché, procediendo con consulta API:", cacheError.message);
+    }
   }
   
-  // 2. Si no existe, llamar a la API
+  // 2. Si no existe en caché o hay error, llamar a la API
   try {
-    const url = `${NEW_API_BASE_URL}${apiPath}?${paramName}=${paramValue}`;
+    const url = `${NEW_API_BASE_URL}${apiPath}?${paramName}=${encodeURIComponent(paramValue)}`;
     console.log(`🔗 Llamando a nueva API: ${url}`);
     
-    const response = await axios.get(url);
-    const resultData = response.data;
+    const response = await axios.get(url, {
+      timeout: 30000, // 30 segundos timeout
+      headers: {
+        'User-Agent': 'API-Consulta-PE/1.0'
+      }
+    });
+    
+    let resultData = response.data;
     
     // 3. Guardar en Storage (asíncrono, no bloquea la respuesta)
-    setTimeout(async () => {
-      try {
-        // Detectar tipo de resultado y guardar apropiadamente
-        if (typeof resultData === 'object') {
-          // Es JSON/texto
-          await saveTextToStorage(endpoint, paramName, paramValue, resultData);
-        } else if (typeof resultData === 'string') {
-          // Podría ser una URL de imagen/PDF o texto plano
-          if (resultData.startsWith('http')) {
-            // Verificar si es imagen o PDF
-            const lowerResult = resultData.toLowerCase();
-            if (lowerResult.includes('.jpg') || lowerResult.includes('.jpeg') || 
-                lowerResult.includes('.png') || lowerResult.includes('.gif')) {
-              await saveMediaFromUrl(endpoint, paramName, paramValue, resultData, 'image');
-            } else if (lowerResult.includes('.pdf')) {
-              await saveMediaFromUrl(endpoint, paramName, paramValue, resultData, 'pdf');
+    if (bucket) {
+      setTimeout(async () => {
+        try {
+          // Detectar tipo de resultado y guardar apropiadamente
+          if (resultData && typeof resultData === 'object') {
+            // Es JSON/texto
+            await saveTextToStorage(endpoint, paramName, paramValue, resultData);
+          } else if (typeof resultData === 'string') {
+            // Podría ser una URL de imagen/PDF o texto plano
+            if (resultData.startsWith('http')) {
+              // Verificar si es imagen o PDF
+              const lowerResult = resultData.toLowerCase();
+              if (lowerResult.match(/\.(jpg|jpeg|png|gif|webp)(\?|$)/)) {
+                await saveMediaFromUrl(endpoint, paramName, paramValue, resultData, 'image');
+              } else if (lowerResult.includes('.pdf')) {
+                await saveMediaFromUrl(endpoint, paramName, paramValue, resultData, 'pdf');
+              } else {
+                // URL no reconocida, guardar como texto
+                await saveTextToStorage(endpoint, paramName, paramValue, { url: resultData });
+              }
             } else {
-              // URL no reconocida, guardar como texto
-              await saveTextToStorage(endpoint, paramName, paramValue, { url: resultData });
+              // Texto plano
+              await saveTextToStorage(endpoint, paramName, paramValue, { text: resultData });
             }
-          } else {
-            // Texto plano
-            await saveTextToStorage(endpoint, paramName, paramValue, { text: resultData });
           }
+        } catch (saveError) {
+          console.error("⚠️ Error al guardar en Storage (no crítico):", saveError.message);
         }
-      } catch (saveError) {
-        console.error("⚠️ Error al guardar en Storage (no crítico):", saveError.message);
-      }
-    }, 0); // setTimeout con 0 para ejecutar después de enviar la respuesta
+      }, 100); // Pequeño delay para no bloquear la respuesta
+    }
     
     // 4. Enviar respuesta al cliente inmediatamente
     return res.status(200).json(resultData);
   } catch (err) {
-    console.error("❌ Error en nueva API:", err.response?.data || err.message);
+    console.error("❌ Error en nueva API:", err.message);
     
-    const statusCode = err.response?.status || 500;
-    const errorMessage = err.response?.data?.message || err.message || "Error en la consulta";
+    let statusCode = 500;
+    let errorMessage = "Error en la consulta";
+    
+    if (err.response) {
+      statusCode = err.response.status;
+      errorMessage = err.response.data?.message || `Error ${statusCode} del servidor`;
+    } else if (err.code === 'ECONNABORTED') {
+      statusCode = 504;
+      errorMessage = "Timeout en la consulta a la API externa";
+    } else if (err.code === 'ENOTFOUND') {
+      statusCode = 503;
+      errorMessage = "No se pudo conectar con la API externa";
+    }
     
     res.status(statusCode).json({
       success: false,
-      message: "Error en la consulta",
-      detalle: errorMessage,
+      message: errorMessage,
+      detalle: err.response?.data || err.message,
+      endpoint: endpoint,
+      param: { name: paramName, value: paramValue }
     });
   }
 };
@@ -353,9 +451,15 @@ const fetchFromNewAPIWithMultipleParams = async (req, res, apiPath, requiredPara
   const paramValue = requiredParams.map(p => req.query[p]).join('_');
   
   // 1. Verificar si existe en Storage
-  const cachedResult = await checkStorageCache(endpoint, paramKey, paramValue);
-  if (cachedResult) {
-    return res.status(200).json(cachedResult);
+  if (bucket) {
+    try {
+      const cachedResult = await checkStorageCache(endpoint, paramKey, paramValue);
+      if (cachedResult) {
+        return res.status(200).json(cachedResult);
+      }
+    } catch (cacheError) {
+      console.warn("⚠️ Error en caché para múltiples parámetros:", cacheError.message);
+    }
   }
   
   // 2. Si no existe, llamar a la API
@@ -363,17 +467,22 @@ const fetchFromNewAPIWithMultipleParams = async (req, res, apiPath, requiredPara
     const url = `${NEW_API_BASE_URL}${apiPath}?${queryParams.toString()}`;
     console.log(`🔗 Llamando a nueva API: ${url}`);
     
-    const response = await axios.get(url);
+    const response = await axios.get(url, {
+      timeout: 30000
+    });
+    
     const resultData = response.data;
     
     // 3. Guardar en Storage (asíncrono)
-    setTimeout(async () => {
-      try {
-        await saveTextToStorage(endpoint, paramKey, paramValue, resultData);
-      } catch (saveError) {
-        console.error("⚠️ Error al guardar en Storage:", saveError.message);
-      }
-    }, 0);
+    if (bucket) {
+      setTimeout(async () => {
+        try {
+          await saveTextToStorage(endpoint, paramKey, paramValue, resultData);
+        } catch (saveError) {
+          console.error("⚠️ Error al guardar en Storage:", saveError.message);
+        }
+      }, 100);
+    }
     
     // 4. Enviar respuesta al cliente
     return res.status(200).json(resultData);
@@ -577,22 +686,42 @@ app.get("/storage/stats", async (req, res) => {
   if (!bucket) {
     return res.status(500).json({
       success: false,
-      message: "Firebase Storage no está configurado"
+      message: "Firebase Storage no está configurado",
+      configured: false,
+      error: "Bucket no disponible"
     });
   }
   
   try {
-    const [files] = await bucket.getFiles({ prefix: 'consultas/' });
+    const [files] = await bucket.getFiles({ prefix: 'consultas/', maxResults: 1000 });
     
     const stats = {
       totalFiles: files.length,
       endpoints: {},
-      totalSize: 0
+      totalSize: 0,
+      byType: {
+        json: 0,
+        images: 0,
+        pdfs: 0,
+        other: 0
+      }
     };
     
     files.forEach(file => {
       const size = parseInt(file.metadata.size || 0);
       stats.totalSize += size;
+      
+      // Determinar tipo de archivo
+      const name = file.name.toLowerCase();
+      if (name.endsWith('.json')) {
+        stats.byType.json++;
+      } else if (name.match(/\.(jpg|jpeg|png|gif|webp)$/)) {
+        stats.byType.images++;
+      } else if (name.endsWith('.pdf')) {
+        stats.byType.pdfs++;
+      } else {
+        stats.byType.other++;
+      }
       
       // Agrupar por endpoint
       const pathParts = file.name.split('/');
@@ -603,17 +732,68 @@ app.get("/storage/stats", async (req, res) => {
     });
     
     stats.totalSizeMB = (stats.totalSize / (1024 * 1024)).toFixed(2);
+    stats.averageFileSize = files.length > 0 ? (stats.totalSize / files.length).toFixed(0) : 0;
     
     res.json({
       success: true,
       stats: stats,
-      bucket: process.env.BUCKET_STORAGE,
-      timestamp: new Date().toISOString()
+      bucket: bucket.name,
+      firebaseConfigured: true,
+      timestamp: new Date().toISOString(),
+      memoryUsage: process.memoryUsage()
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Error al obtener estadísticas",
+      error: error.message,
+      configured: true
+    });
+  }
+});
+
+// Endpoint para limpiar caché manualmente (útil para desarrollo)
+app.delete("/storage/clear", async (req, res) => {
+  if (!bucket) {
+    return res.status(500).json({
+      success: false,
+      message: "Firebase Storage no está configurado"
+    });
+  }
+  
+  try {
+    const [files] = await bucket.getFiles({ prefix: 'consultas/' });
+    
+    if (files.length === 0) {
+      return res.json({
+        success: true,
+        message: "No hay archivos en caché para eliminar",
+        deleted: 0
+      });
+    }
+    
+    // Eliminar archivos en lotes para no sobrecargar la memoria
+    const batchSize = 100;
+    let deletedCount = 0;
+    
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      await Promise.all(batch.map(file => file.delete()));
+      deletedCount += batch.length;
+      console.log(`🗑️ Eliminado lote de ${batch.length} archivos (total: ${deletedCount})`);
+    }
+    
+    res.json({
+      success: true,
+      message: `Caché limpiado exitosamente`,
+      deleted: deletedCount,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("❌ Error al limpiar caché:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error al limpiar caché",
       error: error.message
     });
   }
@@ -626,18 +806,27 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     message: "🚀 API de Consultas PE - Versión Nueva con Firebase Storage",
-    version: "1.1.0",
+    version: "1.2.0",
     nota: "Todas las consultas usan las nuevas APIs con método GET y caché en Firebase Storage",
     firebase_configured: !!bucket,
+    environment: process.env.NODE_ENV || "development",
+    memory: process.memoryUsage(),
     endpoints_disponibles: [
       "Consulta SUNAT: /sun o /sunat?dni_o_ruc=...",
       "Consultas por DNI: /dni, /dnif, /dnidb, etc.",
       "Consultas genéricas: /osiptel, /claro, /entel, etc.",
       "Consultas específicas: /dni_nombres, /denp, /cedula, etc.",
-      "Estadísticas Storage: /storage/stats"
+      "Estadísticas Storage: /storage/stats",
+      "Limpiar caché: DELETE /storage/clear"
     ],
-    total_endpoints: dniEndpoints.length + 21,
-    cache_strategy: "Firebase Storage con verificación previa y guardado asíncrono"
+    total_endpoints: dniEndpoints.length + 22,
+    cache_strategy: "Firebase Storage con verificación previa y guardado asíncrono",
+    optimizations: [
+      "Conexión 0.0.0.0 para Fly.io",
+      "Manejo robusto de Firebase private_key",
+      "Timeouts configurados",
+      "Gestión de memoria optimizada"
+    ]
   });
 });
 
@@ -645,14 +834,25 @@ app.get("/", (req, res) => {
    Endpoint de salud
 ============================ */
 app.get("/health", (req, res) => {
-  res.json({
+  const health = {
     success: true,
     status: "healthy",
     timestamp: new Date().toISOString(),
-    api_base_url_configured: !!NEW_API_BASE_URL,
-    firebase_storage_configured: !!bucket,
-    environment: process.env.NODE_ENV || "development"
-  });
+    uptime: process.uptime(),
+    memory: {
+      rss: `${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`,
+      heapTotal: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`,
+      heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+      external: `${(process.memoryUsage().external / 1024 / 1024).toFixed(2)} MB`
+    },
+    services: {
+      api_base_url: !!NEW_API_BASE_URL,
+      firebase_storage: !!bucket,
+      total_endpoints: dniEndpoints.length + 22
+    }
+  };
+  
+  res.json(health);
 });
 
 /* ============================
@@ -662,18 +862,42 @@ app.use((req, res) => {
   res.status(404).json({
     success: false,
     message: "Endpoint no encontrado",
-    path: req.path
+    path: req.path,
+    available_endpoints: [
+      "/ - Documentación",
+      "/health - Estado del sistema",
+      "/storage/stats - Estadísticas de Storage",
+      "/sun, /sunat - Consultas SUNAT",
+      "/dni, /c4, /tra, etc. - Consultas por DNI",
+      "... y muchos más (ver / para lista completa)"
+    ]
   });
 });
 
 /* ============================
-   Servidor
+   Manejo de errores global
 ============================ */
-app.listen(PORT, () => {
-  console.log(`✅ API nueva corriendo en puerto ${PORT}`);
+app.use((err, req, res, next) => {
+  console.error("💥 Error global no manejado:", err);
+  
+  res.status(500).json({
+    success: false,
+    message: "Error interno del servidor",
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+    timestamp: new Date().toISOString()
+  });
+});
+
+/* ============================
+   Servidor - CORREGIDO para Fly.io
+============================ */
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ API nueva corriendo en 0.0.0.0:${PORT}`);
   console.log(`🌐 URL base de APIs: ${NEW_API_BASE_URL || "No configurada - verificar variable de entorno NEW_API_BASE_URL"}`);
-  console.log(`🔥 Firebase Storage: ${bucket ? "Configurado correctamente" : "No configurado"}`);
+  console.log(`🔥 Firebase Storage: ${bucket ? "Configurado correctamente ✓" : "No configurado ⚠️"}`);
   console.log(`📦 Bucket: ${process.env.BUCKET_STORAGE || "No especificado"}`);
+  console.log(`💾 Memoria inicial: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`🚀 Listo para recibir conexiones en todas las interfaces de red`);
 });
 
 export default app;
